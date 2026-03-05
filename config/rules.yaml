@@ -1,0 +1,392 @@
+# ═══════════════════════════════════════════════════════════════════════
+# ARIS Log Monitoring — Rule Catalog for Detector B3
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Each rule defines a pattern to detect in normalized log records (B1 output).
+#
+# Pattern types:
+#   REGEX       — Match message or stack_trace against a regex
+#   KEYWORD     — Simple substring match (faster than regex)
+#   FREQUENCY   — Triggers when count exceeds threshold in time window
+#   STATE_SEQ   — Triggers on specific state transition sequences (runnable_history)
+#
+# Severity levels: CRITICAL, HIGH, MEDIUM, LOW
+#
+# Rules are evaluated in order. A single log record can match multiple rules.
+# The highest severity match determines the detection severity.
+
+rules:
+
+  # ═══ CRITICAL — Intervento immediato ════════════════════════════════
+
+  - rule_id: C01
+    name: "Pool Exhaustion"
+    description: "Connection pool esaurito — precursore di crash o degrado multi-giorno"
+    pattern_type: KEYWORD
+    pattern: "No free database connection"
+    severity: CRITICAL
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR, FATAL]
+    enabled: true
+    tags: [database, pool, availability]
+    suggested_action: >
+      Verificare il pool di connessioni ARCM (dimensione attuale: 50).
+      Controllare query lente o bloccate su SQL Server.
+      Considerare aumento pool size o restart del runnable.
+    frequency_escalation:
+      threshold: 10
+      window_minutes: 5
+      escalate_to: P1
+
+  - rule_id: C02
+    name: "SQL Server Login Failure"
+    description: "Impossibile aprire il database ARIS10DB — blocco completo del servizio"
+    pattern_type: REGEX
+    pattern: "Cannot open database.*ARIS10DB.*login failed"
+    severity: CRITICAL
+    runnable_filter: [abs_s, arcm_s]
+    level_filter: [ERROR, FATAL]
+    enabled: true
+    tags: [database, authentication, availability]
+    suggested_action: >
+      Verificare lo stato di SQL Server e la connettività di rete.
+      Controllare le credenziali nel file di configurazione del runnable.
+      Verificare che il database ARIS10DB sia online.
+
+  - rule_id: C03
+    name: "Migration Failure"
+    description: "Impossibile calcolare la migrazione dello schema — causa restart loop"
+    pattern_type: KEYWORD
+    pattern: "Cannot calculate migration"
+    severity: CRITICAL
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR, FATAL]
+    enabled: true
+    tags: [database, schema, startup]
+    suggested_action: >
+      Lo schema DB non corrisponde alla versione attesa dal software.
+      Verificare la versione dello schema con la query sulla tabella di migrazione.
+      NON riavviare — il problema persisterà. Serve intervento manuale sulla DB.
+
+  - rule_id: C04
+    name: "INOPERATIVE State"
+    description: "Runnable in stato INOPERATIVE — morte confermata, richiede intervento"
+    pattern_type: KEYWORD
+    pattern: "INOPERATIVE"
+    severity: CRITICAL
+    runnable_filter: []  # any runnable
+    level_filter: [FATAL, ERROR]
+    enabled: true
+    tags: [lifecycle, crash, availability]
+    suggested_action: >
+      Il runnable è terminato in stato INOPERATIVE.
+      Verificare i log di boot per la causa root (tipicamente C02 o C03).
+      Potrebbe essere necessario intervento manuale prima del restart.
+
+  - rule_id: C05
+    name: "BeanCreation During Shutdown"
+    description: "Errore Spring durante shutdown — crash del graceful shutdown"
+    pattern_type: KEYWORD
+    pattern: "BeanCreationNotAllowedException"
+    severity: CRITICAL
+    runnable_filter: [arcm_s]
+    level_filter: [FATAL]
+    enabled: true
+    tags: [spring, lifecycle, crash]
+    suggested_action: >
+      Bug noto di Spring Boot durante lo shutdown.
+      Il runnable si riavvierà automaticamente.
+      Se ripetuto, verificare cosa ha causato lo shutdown iniziale.
+
+  # ═══ HIGH — Problema serio ma non immediatamente fatale ═════════════
+
+  - rule_id: H01
+    name: "NullPointerException in JobMonitoring"
+    description: "NPE nel JobMonitoringTag — precursore di crash arcm_s"
+    pattern_type: REGEX
+    pattern: "NullPointerException.*JobMonitoringTag|JobMonitoringTag.*NullPointerException"
+    severity: HIGH
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR]
+    enabled: true
+    match_stack_trace: true
+    tags: [application, bug, arcm]
+    suggested_action: >
+      Bug applicativo nel monitoraggio job ARCM.
+      Spesso precede un crash completo. Monitorare attentamente
+      nelle ore successive. Se si ripete >3 volte in 1 ora, escalare.
+    frequency_escalation:
+      threshold: 3
+      window_minutes: 60
+      escalate_to: CRITICAL
+
+  - rule_id: H02
+    name: "BUS Cannot Load Object"
+    description: "Errori BUS-10507 ripetuti — problemi di caricamento dati"
+    pattern_type: REGEX
+    pattern: "BUS-10507.*cannot load object"
+    severity: HIGH
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [application, data, arcm]
+    suggested_action: >
+      Errori di caricamento oggetti dal data layer ARCM.
+      In grandi volumi indica corruzione dati o inconsistenza schema.
+      Verificare i log SQL per query fallite correlate.
+    frequency_escalation:
+      threshold: 50
+      window_minutes: 10
+      escalate_to: CRITICAL
+
+  - rule_id: H03
+    name: "BUS Cannot Save Objects"
+    description: "Errori BUS-10201 — impossibile salvare oggetti nel data layer"
+    pattern_type: REGEX
+    pattern: "BUS-10201.*cannot save objects"
+    severity: HIGH
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [application, data, arcm]
+    suggested_action: >
+      Il data layer non riesce a persistere le modifiche.
+      Può indicare lock sul database, pool esaurito, o vincoli violati.
+      Verificare correlazione con C01 (pool exhaustion).
+
+  - rule_id: H04
+    name: "Login Failed BulkExport"
+    description: "Autenticazione fallita per l'utente BulkExport"
+    pattern_type: KEYWORD
+    pattern: "Login failed for user BulkExport"
+    severity: HIGH
+    runnable_filter: [arcm_s, abs_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [authentication, integration]
+    suggested_action: >
+      L'utente di servizio BulkExport non riesce ad autenticarsi.
+      Verificare le credenziali nella configurazione e la validità dell'account su SQL Server.
+
+  # ═══ MEDIUM — Degrado operativo ═════════════════════════════════════
+
+  - rule_id: M01
+    name: "Database Not Found (Banca UBAE)"
+    description: "Riferimento a database inesistente nella configurazione publishing"
+    pattern_type: KEYWORD
+    pattern: "Banca UBAE"
+    severity: MEDIUM
+    runnable_filter: [abs_s]
+    level_filter: [ERROR, WARN]
+    enabled: true
+    tags: [configuration, publishing]
+    suggested_action: >
+      Il database "Banca UBAE" è referenziato nella configurazione di publishing
+      ma non esiste. Correggere la configurazione per rimuovere il riferimento.
+      Non è urgente ma genera rumore nei log.
+
+  - rule_id: M02
+    name: "MBean Not Found (Catalina Executor)"
+    description: "JMX MBean non disponibile durante startup — race condition"
+    pattern_type: REGEX
+    pattern: "MBean.*Catalina.*httpExecutor|MBean.*Catalina.*ajpExecutor"
+    severity: MEDIUM
+    runnable_filter: []
+    level_filter: [ERROR]
+    enabled: true
+    match_stack_trace: true
+    tags: [jmx, startup, monitoring]
+    suggested_action: >
+      Race condition all'avvio: l'agent cerca il MBean Catalina prima che
+      Tomcat lo registri. Normalmente si risolve da solo al ping successivo.
+      Se persiste dopo 5 minuti dal boot, investigare.
+
+  - rule_id: M03
+    name: "Missing Request Parameter"
+    description: "Parametro obbligatorio mancante nella richiesta HTTP"
+    pattern_type: REGEX
+    pattern: "MissingServletRequestParameterException.*(?:dbName|selectedItemId)"
+    severity: MEDIUM
+    runnable_filter: [abs_s]
+    level_filter: [WARN]
+    enabled: true
+    tags: [application, request]
+    suggested_action: >
+      Richieste malformate dall'interfaccia utente o da integrazioni.
+      Occorrenze sporadiche sono normali. Se in volume, verificare
+      l'interfaccia o l'integrazione che genera le richieste.
+
+  - rule_id: M04
+    name: "Plugin Localization Failed"
+    description: "Impossibile caricare le proprietà di localizzazione per it-IT"
+    pattern_type: KEYWORD
+    pattern: "Could not load properties for plugin"
+    severity: MEDIUM
+    runnable_filter: [abs_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [localization, ui]
+    suggested_action: >
+      File di traduzione mancanti per alcuni plugin in italiano.
+      L'interfaccia mostra le chiavi non tradotte. Non è critico
+      ma degrada l'esperienza utente. Segnalare a Software AG.
+
+  - rule_id: M05
+    name: "BUS Cannot Initialize View"
+    description: "Errori BUS-10802 — impossibile inizializzare vista ARCM"
+    pattern_type: REGEX
+    pattern: "BUS-10802.*cannot initialize view"
+    severity: MEDIUM
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [application, ui, arcm]
+    suggested_action: >
+      Errore nell'inizializzazione di una vista ARCM.
+      Se frequente, può indicare corruzione della configurazione della vista.
+
+  - rule_id: M06
+    name: "BUS Internal Exception"
+    description: "Errori BUS-10010 — eccezione interna generica ARCM"
+    pattern_type: REGEX
+    pattern: "BUS-10010.*internal exception"
+    severity: MEDIUM
+    runnable_filter: [arcm_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [application, arcm]
+    suggested_action: >
+      Eccezione interna nel framework BUS di ARCM.
+      Verificare il messaggio completo e lo stack trace per la causa root.
+
+  - rule_id: M07
+    name: "Publishing URL Validation Failed"
+    description: "Errore nella validazione URL di publishing"
+    pattern_type: KEYWORD
+    pattern: "NO_PUBLISHED_DB_ACCESSIBLE"
+    severity: MEDIUM
+    runnable_filter: [abs_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [publishing, configuration]
+    suggested_action: >
+      Nessun database pubblicato accessibile. Verificare la configurazione
+      di content publishing e la disponibilità dei database target.
+
+  # ═══ LOW — Rumore noto o auto-risolvente ════════════════════════════
+
+  - rule_id: L01
+    name: "ZKC Instance Not Found (Startup)"
+    description: "Race condition ZooKeeper all'avvio — si risolve in secondi"
+    pattern_type: KEYWORD
+    pattern: "[ZKC] No registered Instance"
+    severity: LOW
+    runnable_filter: []
+    level_filter: [ERROR]
+    enabled: true
+    tags: [zookeeper, startup, noise]
+    suggested_action: >
+      Normale race condition all'avvio: il runnable cerca la sua registrazione
+      ZooKeeper prima che sia completata. Si risolve automaticamente.
+      Alert solo se persiste per più di 5 minuti dopo il boot.
+
+  - rule_id: L02
+    name: "APG Invalid AppType"
+    description: "Info apptype non valida per APG — componente disattivato"
+    pattern_type: KEYWORD
+    pattern: "Invalid apptype-specific info for app type APG"
+    severity: LOW
+    runnable_filter: [agent]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [apg, deactivated, noise]
+    suggested_action: >
+      apg_s è disattivato ma l'agent tenta ancora di monitorarlo.
+      Ignorare. Se si vuole eliminare il rumore, rimuovere apg_s dalla
+      configurazione dell'agent.
+
+  - rule_id: L03
+    name: "Netty Version Mismatch"
+    description: "Warning cosmetico Azure SDK — versioni Netty non allineate"
+    pattern_type: KEYWORD
+    pattern: "Netty dependencies have versions that do not match"
+    severity: LOW
+    runnable_filter: [abs_s]
+    level_filter: [WARN]
+    enabled: true
+    tags: [dependency, cosmetic]
+    suggested_action: >
+      Warning cosmetico dell'Azure SDK. Non ha impatto funzionale.
+      Si risolve con aggiornamento delle dipendenze Netty, ma non è urgente.
+
+  - rule_id: L04
+    name: "Invalid XSRF Token"
+    description: "Token XSRF scaduto — sessioni utente scadute normalmente"
+    pattern_type: KEYWORD
+    pattern: "Invalid RPC token (Invalid XSRF token)"
+    severity: LOW
+    runnable_filter: [abs_s]
+    level_filter: [ERROR]
+    enabled: true
+    tags: [session, authentication, noise]
+    suggested_action: >
+      Sessione utente scaduta — comportamento normale.
+      L'utente deve fare re-login. Non richiede azione.
+
+  # ═══ STATE SEQUENCE — Pattern su transizioni di stato ════════════════
+
+  - rule_id: S01
+    name: "Restart Loop"
+    description: "3+ restart dello stesso runnable in 10 minuti — loop di crash"
+    pattern_type: STATE_SEQUENCE
+    state_sequence:
+      - "STARTING"
+      - "DOWN"
+      - "STARTING"
+      - "DOWN"
+      - "STARTING"
+    severity: CRITICAL
+    runnable_filter: []
+    window_minutes: 10
+    enabled: true
+    tags: [lifecycle, restart_loop, availability]
+    suggested_action: >
+      Il runnable è in un loop di restart. Ogni tentativo fallisce.
+      NON riavviare manualmente — il problema si ripeterà.
+      Verificare i FATAL nel system.out.log per la causa root.
+      Tipiche cause: C03 (migration failure), C02 (DB non raggiungibile).
+
+  - rule_id: S02
+    name: "Runnable Down Without Recovery"
+    description: "Runnable in stato DOWN da più di 5 minuti senza restart"
+    pattern_type: STATE_SEQUENCE
+    state_sequence:
+      - "STARTED"
+      - "DOWN"
+    severity: HIGH
+    runnable_filter: []
+    window_minutes: 5
+    no_followup_state: "STARTING"  # triggers if STARTING doesn't appear within window
+    enabled: true
+    tags: [lifecycle, crash, availability]
+    suggested_action: >
+      Il runnable è crashato e non si è riavviato automaticamente.
+      Verificare se l'agent è attivo e se il runnable è configurato per auto-restart.
+
+  - rule_id: S03
+    name: "Graceful Shutdown Timeout"
+    description: "Runnable in stato STOPPING da più di 3 minuti"
+    pattern_type: STATE_SEQUENCE
+    state_sequence:
+      - "STARTED"
+      - "STOPPING"
+    severity: MEDIUM
+    runnable_filter: []
+    window_minutes: 3
+    no_followup_state: "STOPPED"
+    enabled: true
+    tags: [lifecycle, shutdown]
+    suggested_action: >
+      Lo shutdown sta impiegando troppo tempo.
+      Possibili cause: thread bloccati, connessioni non chiuse, job in esecuzione.
+      Se supera i 5 minuti, considerare kill forzato.

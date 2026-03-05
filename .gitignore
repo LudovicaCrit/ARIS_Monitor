@@ -1,0 +1,14 @@
+# Dati - mai in git
+data/*.log
+data/*.csv
+data/*.jfr
+test_samples/
+
+# Python
+__pycache__/
+*.pyc
+.venv*/
+
+# OS
+.DS_Store
+Thumbs.db
