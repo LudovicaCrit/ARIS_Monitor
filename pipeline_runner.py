@@ -190,6 +190,12 @@ def run_pipeline(base_dir: str, output_csv: str, interval_seconds: int = 300):
     print(f"  Files parsed: {files_parsed}, failed: {files_failed}")
     print(f"  Total records: {total_records}")
 
+    # ── Step 2b: Build temporal index for fast lookups ──
+    print(f"\n  Building temporal index (bisect)...")
+    idx_start = time.time()
+    builder.log_accumulator.prepare_index()
+    print(f"  Index built in {time.time() - idx_start:.1f}s")
+
     # ── Step 3: Build feature vectors ──
     print(f"\n{'='*70}")
     print("STEP 3: Building feature vectors for all runnables...")
@@ -198,31 +204,55 @@ def run_pipeline(base_dir: str, output_csv: str, interval_seconds: int = 300):
     runnables = builder.log_accumulator.get_runnables()
     print(f"  Runnables with data: {sorted(runnables)}")
 
+    # Show record counts per runnable so we know who's the big one
+    for rn in sorted(runnables):
+        rn_recs = len(builder.log_accumulator._records.get(rn, []))
+        print(f"    {rn:25s}: {rn_recs:>8d} records")
+
     all_vectors = []
     for runnable in sorted(runnables):
+        r_start = time.time()
+
+        # Get time range for this runnable to show progress
+        rn_epochs = builder.log_accumulator._epochs.get(runnable, [])
+        if rn_epochs:
+            rn_start = (rn_epochs[0] // interval_seconds) * interval_seconds
+            rn_end = rn_epochs[-1]
+            total_windows = (rn_end - rn_start) // interval_seconds
+        else:
+            total_windows = 0
+
+        print(f"    {runnable:25s}: ~{total_windows:>7d} windows to build...", end="", flush=True)
+
         vectors = builder.build_vectors(runnable, interval_seconds=interval_seconds)
+        build_time = time.time() - r_start
+
         if vectors:
             # Filter out vectors where everything is zero (saves space)
-            meaningful = [v for v in vectors if (
-                v.error_count_5m > 0 or v.error_count_1h > 0 or
-                v.fatal_count_1h > 0 or v.state_transitions_1h > 0 or
-                v.restarts_24h > 0 or v.pool_exhaustion_count_5m > 0 or
-                v.current_state not in ("STARTED", "UNKNOWN") or
-                v.heap_committed_mb > 0
-            )]
+            # Use a set of indices for O(1) lookup instead of O(n) list search
+            meaningful_idx = set()
+            for i, v in enumerate(vectors):
+                if (v.error_count_5m > 0 or v.error_count_1h > 0 or
+                    v.fatal_count_1h > 0 or v.state_transitions_1h > 0 or
+                    v.restarts_24h > 0 or v.pool_exhaustion_count_5m > 0 or
+                    v.current_state not in ("STARTED", "UNKNOWN") or
+                    v.heap_committed_mb > 0):
+                    meaningful_idx.add(i)
+
             # Also keep one "normal" vector per hour for baseline
             last_normal_epoch = 0
-            for v in vectors:
-                if v not in meaningful:
+            for i, v in enumerate(vectors):
+                if i not in meaningful_idx:
                     if v.window_end_epoch - last_normal_epoch >= 3600:
-                        meaningful.append(v)
+                        meaningful_idx.add(i)
                         last_normal_epoch = v.window_end_epoch
 
-            meaningful.sort(key=lambda v: v.window_end_epoch)
+            meaningful = [vectors[i] for i in sorted(meaningful_idx)]
             all_vectors.extend(meaningful)
-            print(f"    {runnable:25s}: {len(vectors):7d} total → {len(meaningful):7d} meaningful vectors")
+            r_elapsed = time.time() - r_start
+            print(f"\r    {runnable:25s}: {len(vectors):7d} total → {len(meaningful):7d} meaningful ({r_elapsed:.1f}s, build {build_time:.1f}s)")
         else:
-            print(f"    {runnable:25s}: no vectors")
+            print(f"\r    {runnable:25s}: no vectors")
 
     # ── Step 4: Export CSV ──
     print(f"\n{'='*70}")

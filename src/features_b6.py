@@ -23,6 +23,7 @@ aligned to the CSV sampling interval.
 import csv
 import re
 import os
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Iterator
@@ -247,6 +248,10 @@ class LogAccumulator:
     """
     Accumulates B1 log records and computes log-derived features
     for any given time window.
+
+    After all records are added, call prepare_index() to sort by epoch
+    and build a bisect-compatible index for O(log n) window lookups.
+    Without the index, compute_log_features falls back to O(n) linear scan.
     """
 
     def __init__(self):
@@ -256,11 +261,20 @@ class LogAccumulator:
         self._state_history: dict = defaultdict(list)
         # runnable → list of restart timestamps (epoch)
         self._restarts: dict = defaultdict(list)
+        # ── bisect index (built by prepare_index) ──
+        self._sorted: bool = False
+        # runnable → sorted list of epoch ints (parallel to _records)
+        self._epochs: dict = {}
+        # runnable → sorted list of epoch ints for state_history
+        self._state_epochs: dict = {}
+        # runnable → sorted list of restart epochs
+        self._restart_epochs: dict = {}
 
     def add_record(self, record: LogRecord):
         """Add a parsed log record."""
         epoch = int(record.timestamp.timestamp())
         self._records[record.runnable].append((epoch, record))
+        self._sorted = False  # mark index as stale
 
         # Track state changes
         if record.format_type == FormatType.RUNNABLE_HIST and "State change:" in record.message:
@@ -280,9 +294,117 @@ class LogAccumulator:
         for r in records:
             self.add_record(r)
 
+    def prepare_index(self):
+        """
+        Sort all records by epoch and build parallel epoch arrays for bisect.
+        Call this ONCE after all records have been added, before build_vectors.
+
+        This turns compute_log_features from O(n) per call to O(log n + k),
+        where k is the number of records in the window — typically very small.
+
+        For the full ARIS dataset (~945k records, ~153k windows per runnable),
+        this reduces build_vectors from hours to seconds.
+        """
+        for runnable, records in self._records.items():
+            records.sort(key=lambda x: x[0])
+            self._epochs[runnable] = [t for t, _ in records]
+
+        for runnable, history in self._state_history.items():
+            history.sort(key=lambda x: x[0])
+            self._state_epochs[runnable] = [t for t, _ in history]
+
+        for runnable, restarts in self._restarts.items():
+            restarts.sort()
+            self._restart_epochs[runnable] = restarts  # already sorted in place
+
+        self._sorted = True
+
+    def _get_records_in_range(self, runnable: str, start_epoch: int, end_epoch: int) -> list:
+        """
+        Return LogRecord objects in [start_epoch, end_epoch] using bisect.
+        Falls back to linear scan if index is not built.
+        """
+        records = self._records.get(runnable, [])
+        if not records:
+            return []
+
+        if self._sorted and runnable in self._epochs:
+            epochs = self._epochs[runnable]
+            lo = bisect_left(epochs, start_epoch)
+            hi = bisect_right(epochs, end_epoch)
+            return [records[i][1] for i in range(lo, hi)]
+        else:
+            # Fallback: linear scan (used if prepare_index not called)
+            return [r for t, r in records if start_epoch <= t <= end_epoch]
+
+    def _count_states_in_range(self, runnable: str, start_epoch: int, end_epoch: int) -> int:
+        """Count state transitions in [start_epoch, end_epoch] using bisect."""
+        history = self._state_history.get(runnable, [])
+        if not history:
+            return 0
+
+        if self._sorted and runnable in self._state_epochs:
+            epochs = self._state_epochs[runnable]
+            lo = bisect_left(epochs, start_epoch)
+            hi = bisect_right(epochs, end_epoch)
+            return hi - lo
+        else:
+            return sum(1 for t, _ in history if start_epoch <= t <= end_epoch)
+
+    def _get_current_state(self, runnable: str, at_epoch: int) -> str:
+        """Get most recent state at or before at_epoch using bisect."""
+        history = self._state_history.get(runnable, [])
+        if not history:
+            return "UNKNOWN"
+
+        if self._sorted and runnable in self._state_epochs:
+            epochs = self._state_epochs[runnable]
+            idx = bisect_right(epochs, at_epoch) - 1
+            if idx >= 0:
+                return history[idx][1]
+            return "UNKNOWN"
+        else:
+            for t, s in reversed(history):
+                if t <= at_epoch:
+                    return s
+            return "UNKNOWN"
+
+    def _count_restarts_in_range(self, runnable: str, start_epoch: int, end_epoch: int) -> int:
+        """Count restarts in [start_epoch, end_epoch] using bisect."""
+        restarts = self._restarts.get(runnable, [])
+        if not restarts:
+            return 0
+
+        if self._sorted and runnable in self._restart_epochs:
+            epochs = self._restart_epochs[runnable]
+            lo = bisect_left(epochs, start_epoch)
+            hi = bisect_right(epochs, end_epoch)
+            return hi - lo
+        else:
+            return sum(1 for t in restarts if start_epoch <= t <= end_epoch)
+
+    def _get_last_restart_before(self, runnable: str, at_epoch: int) -> Optional[int]:
+        """Get most recent restart epoch at or before at_epoch."""
+        restarts = self._restarts.get(runnable, [])
+        if not restarts:
+            return None
+
+        if self._sorted and runnable in self._restart_epochs:
+            epochs = self._restart_epochs[runnable]
+            idx = bisect_right(epochs, at_epoch) - 1
+            if idx >= 0:
+                return epochs[idx]
+            return None
+        else:
+            recent = [t for t in restarts if t <= at_epoch]
+            return max(recent) if recent else None
+
     def compute_log_features(self, runnable: str, window_end_epoch: int) -> dict:
         """
         Compute log-derived features for a runnable at a given time.
+
+        If prepare_index() has been called, uses bisect for O(log n + k) lookups.
+        Otherwise falls back to O(n) linear scan (backward compatible).
 
         Returns a dict with feature values.
         """
@@ -291,12 +413,10 @@ class LogAccumulator:
         w24h = window_end_epoch - 86400   # 24 hours ago
         prev_5m_start = w5m - 300         # previous 5-min window
 
-        records = self._records.get(runnable, [])
-
-        # Filter to windows
-        in_5m = [r for t, r in records if w5m <= t <= window_end_epoch]
-        in_1h = [r for t, r in records if w1h <= t <= window_end_epoch]
-        in_prev_5m = [r for t, r in records if prev_5m_start <= t < w5m]
+        # ── Get records in each window using bisect ──
+        in_5m = self._get_records_in_range(runnable, w5m, window_end_epoch)
+        in_1h = self._get_records_in_range(runnable, w1h, window_end_epoch)
+        in_prev_5m = self._get_records_in_range(runnable, prev_5m_start, w5m - 1)
 
         # Error counts
         errors_5m = sum(1 for r in in_5m if r.level in (LogLevel.ERROR, LogLevel.FATAL))
@@ -321,23 +441,16 @@ class LogAccumulator:
         bus_5m = sum(1 for r in in_5m if "BUS-" in r.message)
         zkc_5m = sum(1 for r in in_5m if "No registered Instance" in r.message)
 
-        # State features
-        state_hist = self._state_history.get(runnable, [])
-        transitions_1h = sum(1 for t, _ in state_hist if w1h <= t <= window_end_epoch)
-        current_state = "UNKNOWN"
-        for t, s in reversed(state_hist):
-            if t <= window_end_epoch:
-                current_state = s
-                break
+        # State features (using bisect helpers)
+        transitions_1h = self._count_states_in_range(runnable, w1h, window_end_epoch)
+        current_state = self._get_current_state(runnable, window_end_epoch)
 
         # Restarts in 24h
-        restart_times = self._restarts.get(runnable, [])
-        restarts_24h = sum(1 for t in restart_times if w24h <= t <= window_end_epoch)
+        restarts_24h = self._count_restarts_in_range(runnable, w24h, window_end_epoch)
 
         # Minutes since last restart
-        recent_restarts = [t for t in restart_times if t <= window_end_epoch]
-        if recent_restarts:
-            last_restart = max(recent_restarts)
+        last_restart = self._get_last_restart_before(runnable, window_end_epoch)
+        if last_restart is not None:
             minutes_since = (window_end_epoch - last_restart) / 60
         else:
             minutes_since = -1.0
@@ -363,15 +476,41 @@ class LogAccumulator:
         """Return all runnables that have records."""
         return list(self._records.keys())
 
+    def get_runnable_time_range(self, runnable: str) -> tuple:
+        """Return (min_epoch, max_epoch) for a specific runnable."""
+        if self._sorted and runnable in self._epochs:
+            epochs = self._epochs[runnable]
+            if epochs:
+                return (epochs[0], epochs[-1])
+            return (0, 0)
+        else:
+            records = self._records.get(runnable, [])
+            if not records:
+                return (0, 0)
+            times = [t for t, _ in records]
+            return (min(times), max(times))
+
     def get_time_range(self) -> tuple:
         """Return (min_epoch, max_epoch) across all records."""
-        all_times = []
-        for records in self._records.values():
-            for t, _ in records:
-                all_times.append(t)
-        if not all_times:
-            return (0, 0)
-        return (min(all_times), max(all_times))
+        if self._sorted:
+            # Fast path: just check first/last of each sorted epoch array
+            min_t = None
+            max_t = None
+            for epochs in self._epochs.values():
+                if epochs:
+                    if min_t is None or epochs[0] < min_t:
+                        min_t = epochs[0]
+                    if max_t is None or epochs[-1] > max_t:
+                        max_t = epochs[-1]
+            return (min_t or 0, max_t or 0)
+        else:
+            all_times = []
+            for records in self._records.values():
+                for t, _ in records:
+                    all_times.append(t)
+            if not all_times:
+                return (0, 0)
+            return (min(all_times), max(all_times))
 
 
 # ─── Feature vector builder ──────────────────────────────────────────────────
@@ -436,6 +575,7 @@ class FeatureBuilder:
         interval_seconds: int = 300,
         start_epoch: Optional[int] = None,
         end_epoch: Optional[int] = None,
+        progress_every: int = 10000,
     ) -> list:
         """
         Build feature vectors for a runnable at regular intervals.
@@ -443,27 +583,33 @@ class FeatureBuilder:
         Args:
             runnable: The runnable to compute features for.
             interval_seconds: Time between vectors (default 300 = 5 minutes).
-            start_epoch: Start time (default: first record).
-            end_epoch: End time (default: last record).
+            start_epoch: Start time (default: first record FOR THIS RUNNABLE).
+            end_epoch: End time (default: last record FOR THIS RUNNABLE).
+            progress_every: Print progress every N vectors (0 to disable).
 
         Returns:
             List of FeatureVector objects.
         """
-        # Determine time range
-        log_start, log_end = self.log_accumulator.get_time_range()
+        # Determine time range — PER RUNNABLE, not global
+        rn_start, rn_end = self.log_accumulator.get_runnable_time_range(runnable)
+        if rn_start == 0 and rn_end == 0:
+            return []
+
         if start_epoch is None:
-            start_epoch = log_start
+            start_epoch = rn_start
         if end_epoch is None:
-            end_epoch = log_end
+            end_epoch = rn_end
 
         if start_epoch >= end_epoch:
             return []
 
         # Align to interval boundaries
         start_epoch = (start_epoch // interval_seconds) * interval_seconds
+        total_windows = (end_epoch - start_epoch) // interval_seconds
         vectors = []
 
         t = start_epoch + interval_seconds  # first window_end
+        count = 0
         while t <= end_epoch:
             fv = FeatureVector(
                 runnable=runnable,
@@ -494,6 +640,15 @@ class FeatureBuilder:
 
             vectors.append(fv)
             t += interval_seconds
+            count += 1
+
+            # Progress indicator
+            if progress_every > 0 and count % progress_every == 0:
+                pct = count * 100 // max(total_windows, 1)
+                print(f"\r      ... {count:>7d}/{total_windows} windows ({pct}%)", end="", flush=True)
+
+        if progress_every > 0 and count > progress_every:
+            print(f"\r      ... {count:>7d}/{total_windows} windows (100%)   ")
 
         return vectors
 
